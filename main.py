@@ -6,8 +6,10 @@ Archivo principal de la aplicación
 
 import sys
 import os
+import time
+import signal
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
 
 # Agregar el directorio src al path
@@ -17,12 +19,63 @@ from src.gui.main_window import MainWindow
 from src.core.database_manager import DatabaseManager
 
 
+class FaceGuardApplication(QApplication):
+    """Clase personalizada de aplicación para manejo mejorado de eventos"""
+    
+    def __init__(self, argv):
+        super().__init__(argv)
+        self.main_window = None
+        self._is_shutting_down = False
+        
+        # Configurar manejo de señales del sistema
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        # Timer para procesar señales de interrupción en Windows
+        self.signal_timer = QTimer()
+        self.signal_timer.timeout.connect(lambda: None)
+        self.signal_timer.start(500)
+    
+    def _signal_handler(self, signum, frame):
+        """Manejar señales del sistema (Ctrl+C, etc.)"""
+        print(f"\nSeñal recibida: {signum}")
+        self.safe_quit()
+    
+    def safe_quit(self):
+        """Cerrar aplicación de forma segura"""
+        if self._is_shutting_down:
+            return
+            
+        print("Iniciando cierre seguro de la aplicación...")
+        self._is_shutting_down = True
+        
+        # Detener timer de señales
+        if hasattr(self, 'signal_timer'):
+            self.signal_timer.stop()
+        
+        # Cerrar ventana principal
+        if self.main_window is not None:
+            try:
+                self.main_window.safe_close()
+            except Exception as e:
+                print(f"Error cerrando ventana principal: {e}")
+        
+        # Procesar eventos pendientes
+        self.processEvents()
+        
+        # Salir de la aplicación
+        QTimer.singleShot(1000, self.quit)
+
+
 def main():
     """Función principal de la aplicación"""
-    # Crear la aplicación Qt
-    app = QApplication(sys.argv)
+    # Crear la aplicación Qt personalizada
+    app = FaceGuardApplication(sys.argv)
     app.setApplicationName("FaceGuard")
     app.setApplicationVersion("1.0.0")
+    
+    # IMPORTANTE: Configurar para que la app no termine automáticamente
+    app.setQuitOnLastWindowClosed(False)  # Cambiar a False para control manual
     
     # Configurar estilo oscuro
     app.setStyleSheet("""
@@ -61,16 +114,71 @@ def main():
     """)
     
     # Inicializar la base de datos
-    db_manager = DatabaseManager()
-    db_manager.initialize_database()
+    try:
+        db_manager = DatabaseManager()
+        db_manager.initialize_database()
+        print("Base de datos inicializada correctamente")
+    except Exception as e:
+        print(f"Error inicializando base de datos: {e}")
+        return 1
     
     # Crear y mostrar la ventana principal
-    main_window = MainWindow()
-    main_window.show()
+    exit_code = 1
     
-    # Ejecutar la aplicación
-    sys.exit(app.exec_())
+    try:
+        main_window = MainWindow()
+        app.main_window = main_window  # Asignar referencia
+        
+        # Conectar señal de cierre de ventana con cierre de aplicación
+        main_window.window_closed.connect(app.safe_quit)
+        
+        main_window.show()
+        
+        print("Aplicación iniciada correctamente")
+        
+        # Ejecutar la aplicación
+        exit_code = app.exec_()
+        
+        print("Aplicación terminada con código:", exit_code)
+        
+    except Exception as e:
+        print(f"Error en la aplicación: {e}")
+        exit_code = 1
+    
+    finally:
+        # Limpiar recursos de forma explícita
+        print("Limpiando recursos...")
+        
+        if hasattr(app, 'main_window') and app.main_window is not None:
+            try:
+                # Asegurar que la ventana se cierre correctamente
+                app.main_window.safe_close()
+                app.main_window.deleteLater()
+            except Exception as e:
+                print(f"Error cerrando ventana principal: {e}")
+        
+        # Procesar eventos pendientes
+        try:
+            app.processEvents()
+        except:
+            pass
+        
+        # Dar tiempo para que los threads terminen
+        time.sleep(1.0)
+        
+        print("Limpieza completada")
+    
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        exit_code = main()
+        print(f"Saliendo con código: {exit_code}")
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        print("\nInterrumpido por el usuario")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Error fatal: {e}")
+        sys.exit(1)

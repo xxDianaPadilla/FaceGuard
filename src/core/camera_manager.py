@@ -1,343 +1,385 @@
+# =============================================================================
+# 1. VERSIÓN SINGLETON DE CAMERA MANAGER
+# =============================================================================
+
 """
-Gestor de cámara para FaceGuard
-Maneja la captura de video y configuración de la cámara
+Gestor de cámara Singleton para FaceGuard
+Asegura una sola instancia para evitar conflictos
 """
 
+import threading
+import time
 import cv2
 import numpy as np
+from enum import Enum
 from typing import Optional, Tuple, List
 
 
-class CameraManager:
-    """Clase para manejar todas las operaciones de cámara"""
+class CameraState(Enum):
+    """Estados de la cámara"""
+    DISCONNECTED = "disconnected"
+    INITIALIZING = "initializing"
+    CONNECTED = "connected"
+    ERROR = "error"
+
+
+class CameraManagerSingleton:
+    """Clase Singleton para manejar todas las operaciones de cámara"""
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, camera_index: int = 0):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
     
     def __init__(self, camera_index: int = 0):
+        # Solo inicializar una vez
+        if self._initialized:
+            return
+            
         self.camera_index = camera_index
         self.cap = None
-        self.is_initialized = False
+        self.state = CameraState.DISCONNECTED
         self.frame_width = 640
         self.frame_height = 480
         self.fps = 30
-    
-    def initialize_camera(self) -> bool:
-        """
-        Inicializar la cámara
+
+        # Threading y control de acceso
+        self._camera_lock = threading.RLock()
+        self.last_frame = None
+        self.frame_timestamp = 0
+        self.max_init_attempts = 3
         
-        Returns:
-            bool: True si se inicializó correctamente
-        """
+        # Configuración de calidad
+        self._enhancement_enabled = True
+        self._quality_mode = "normal"
+        
+        # Control de liberación y usuarios activos
+        self._is_releasing = False
+        self._active_users = set()  # Rastrea qué pantallas usan la cámara
+        self._user_lock = threading.Lock()
+        
+        self._initialized = True
+        print("CameraManager Singleton creado")
+    
+    def register_user(self, user_id: str):
+        """Registrar un usuario de la cámara"""
+        with self._user_lock:
+            self._active_users.add(user_id)
+            print(f"Usuario registrado: {user_id}. Usuarios activos: {len(self._active_users)}")
+    
+    def unregister_user(self, user_id: str):
+        """Desregistrar un usuario de la cámara"""
+        with self._user_lock:
+            self._active_users.discard(user_id)
+            print(f"Usuario desregistrado: {user_id}. Usuarios activos: {len(self._active_users)}")
+            
+            # Si no hay usuarios activos, liberar cámara
+            if len(self._active_users) == 0 and not self._is_releasing:
+                print("No hay usuarios activos, liberando cámara...")
+                self._release_camera_internal()
+    
+    def has_active_users(self) -> bool:
+        """Verificar si hay usuarios activos"""
+        with self._user_lock:
+            return len(self._active_users) > 0
+    
+    @property
+    def is_initialized(self) -> bool:
+        """Propiedad para verificar si la cámara está inicializada"""
+        with self._camera_lock:
+            return (self.state == CameraState.CONNECTED and 
+                   self.cap is not None and 
+                   self.cap.isOpened() and 
+                   not self._is_releasing)
+
+    def _cleanup_camera_resources(self):
+        """Limpiar recursos de cámara de forma segura"""
         try:
-            # Liberar cámara si ya está inicializada
             if self.cap is not None:
-                self.cap.release()
+                if self.cap.isOpened():
+                    self.cap.release()
+                self.cap = None
+                
+            self.state = CameraState.DISCONNECTED
+            print("Recursos de cámara limpiados")
             
-            # Intentar inicializar cámara
-            self.cap = cv2.VideoCapture(self.camera_index)
+            # Limpiar OpenCV windows si existen
+            cv2.destroyAllWindows()
             
-            if not self.cap.isOpened():
-                print(f"No se pudo abrir la cámara con índice {self.camera_index}")
+        except Exception as e:
+            print(f"Error limpiando recursos de cámara: {e}")
+            self.cap = None
+            self.state = CameraState.ERROR
+        
+        finally:
+            # Pausa para que el SO libere recursos
+            time.sleep(0.1)
+    
+    def initialize_camera(self, user_id: str = None) -> bool:
+        """Inicializar la cámara"""
+        if user_id:
+            self.register_user(user_id)
+        
+        with self._camera_lock:
+            if self._is_releasing:
                 return False
             
-            # Configurar propiedades de la cámara
+            # Si ya está conectada, solo retornar True
+            if self.state == CameraState.CONNECTED and self.cap and self.cap.isOpened():
+                print("Cámara ya está inicializada")
+                return True
+                
+            # Limpiar recursos existentes
+            self._cleanup_camera_resources()
+            self.state = CameraState.INITIALIZING
+        
+        for attempt in range(self.max_init_attempts):
+            try:
+                print(f"Intento {attempt + 1} de inicialización de cámara...")
+                
+                if attempt > 0:
+                    time.sleep(1.0)
+                
+                with self._camera_lock:
+                    if self._is_releasing:
+                        return False
+                        
+                    # Crear nueva captura
+                    self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+                    
+                    if not self.cap.isOpened():
+                        print(f"No se pudo abrir cámara en intento {attempt + 1}")
+                        self._cleanup_camera_resources()
+                        continue
+                    
+                    # Configurar propiedades
+                    success = self._configure_camera_properties()
+                    if not success:
+                        print(f"Error configurando propiedades en intento {attempt + 1}")
+                        self._cleanup_camera_resources()
+                        continue
+                
+                # Test de captura
+                success = self._test_camera_capture()
+                if success:
+                    with self._camera_lock:
+                        if not self._is_releasing:
+                            self.state = CameraState.CONNECTED
+                            print(f"Cámara inicializada correctamente en intento {attempt + 1}")
+                            return True
+                        else:
+                            self._cleanup_camera_resources()
+                            return False
+                else:
+                    with self._camera_lock:
+                        self._cleanup_camera_resources()
+                
+            except Exception as e:
+                print(f"Error en intento {attempt + 1}: {e}")
+                with self._camera_lock:
+                    self._cleanup_camera_resources()
+                continue
+        
+        with self._camera_lock:
+            self.state = CameraState.ERROR
+        print("No se pudo inicializar la cámara después de todos los intentos")
+        return False
+    
+    def _configure_camera_properties(self) -> bool:
+        """Configurar propiedades de la cámara"""
+        try:
+            if self._is_releasing or self.cap is None:
+                return False
+                
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
             self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
-            # Configuraciones adicionales para mejor calidad
-            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Desactivar auto exposición
+            self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
             self.cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.5)
             self.cap.set(cv2.CAP_PROP_CONTRAST, 0.5)
             self.cap.set(cv2.CAP_PROP_SATURATION, 0.5)
             
-            # Verificar que la cámara funcione
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                print("No se pudo capturar frame de la cámara")
-                self.cap.release()
-                return False
-            
-            self.is_initialized = True
-            print(f"Cámara inicializada: {self.get_camera_info()}")
             return True
             
         except Exception as e:
-            print(f"Error inicializando cámara: {e}")
-            if self.cap is not None:
-                self.cap.release()
+            print(f"Error configurando propiedades: {e}")
+            return False
+    
+    def _test_camera_capture(self) -> bool:
+        """Probar captura de la cámara"""
+        try:
+            for test_attempt in range(5):
+                if self._is_releasing:
+                    return False
+                    
+                with self._camera_lock:
+                    if self.cap is None or not self.cap.isOpened() or self._is_releasing:
+                        return False
+                    ret, frame = self.cap.read()
+                
+                if ret and frame is not None and frame.size > 0:
+                    with self._camera_lock:
+                        if not self._is_releasing:
+                            self.last_frame = frame.copy()
+                            self.frame_timestamp = time.time()
+                        return not self._is_releasing
+                time.sleep(0.1)
+            
+            return False
+            
+        except Exception as e:
+            print(f"Error probando captura: {e}")
             return False
     
     def get_frame(self) -> Optional[np.ndarray]:
-        """
-        Capturar un frame de la cámara
-        
-        Returns:
-            Imagen numpy array en formato BGR o None si hay error
-        """
-        if not self.is_initialized or self.cap is None:
-            return None
+        """Capturar un frame de la cámara"""
+        if self.state != CameraState.CONNECTED or self._is_releasing:
+            with self._camera_lock:
+                if self.last_frame is not None and not self._is_releasing:
+                    return self.last_frame.copy()
+                return None
         
         try:
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
-                # Aplicar mejoras básicas de imagen
-                frame = self.enhance_frame(frame)
+            with self._camera_lock:
+                if (self.cap is None or 
+                    not self.cap.isOpened() or 
+                    self._is_releasing):
+                    if self.last_frame is not None:
+                        return self.last_frame.copy()
+                    return None
+                
+                ret, frame = None, None
+                for _ in range(2):
+                    if self._is_releasing:
+                        break
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        break
+            
+            if ret and frame is not None and frame.size > 0 and not self._is_releasing:
+                if self._enhancement_enabled:
+                    frame = self.enhance_frame(frame)
+                
+                with self._camera_lock:
+                    if not self._is_releasing:
+                        self.last_frame = frame.copy()
+                        self.frame_timestamp = time.time()
+                
                 return frame
             else:
-                return None
+                if not self._is_releasing:
+                    print("Error capturando frame")
+                with self._camera_lock:
+                    if self.last_frame is not None and not self._is_releasing:
+                        return self.last_frame.copy()
+                    return None
                 
         except Exception as e:
-            print(f"Error capturando frame: {e}")
-            return None
+            if not self._is_releasing:
+                print(f"Excepción capturando frame: {e}")
+            with self._camera_lock:
+                if not self._is_releasing:
+                    self.state = CameraState.ERROR
+                if self.last_frame is not None and not self._is_releasing:
+                    return self.last_frame.copy()
+                return None
     
     def enhance_frame(self, frame: np.ndarray) -> np.ndarray:
-        """
-        Aplicar mejoras básicas a la imagen
+        """Aplicar mejoras básicas a la imagen"""
+        if frame is None or frame.size == 0 or self._is_releasing:
+            return frame
         
-        Args:
-            frame: Frame original
-            
-        Returns:
-            Frame mejorado
-        """
         try:
-            # Voltear horizontalmente para efecto espejo
-            frame = cv2.flip(frame, 1)
+            enhanced_frame = cv2.flip(frame, 1)
             
-            # Ajuste automático de contraste y brillo
-            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            lab = cv2.cvtColor(enhanced_frame, cv2.COLOR_BGR2LAB)
             l_channel, a, b = cv2.split(lab)
-            
-            # Aplicar CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
             cl = clahe.apply(l_channel)
-            
-            # Recombinar canales
+
             enhanced_lab = cv2.merge((cl, a, b))
             enhanced_frame = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-            
+
             return enhanced_frame
-            
+        
         except Exception as e:
-            print(f"Error mejorando frame: {e}")
+            if not self._is_releasing:
+                print(f"Error mejorando frame: {e}")
             return frame
     
-    def capture_high_quality_frame(self) -> Optional[np.ndarray]:
-        """
-        Capturar un frame de alta calidad
-        Toma múltiples frames y selecciona el mejor
-        
-        Returns:
-            Frame de mejor calidad o None si hay error
-        """
-        if not self.is_initialized:
-            return None
-        
-        try:
-            frames = []
-            scores = []
-            
-            # Capturar múltiples frames
-            for _ in range(5):
-                frame = self.get_frame()
-                if frame is not None:
-                    frames.append(frame)
-                    # Calcular score de calidad (nitidez)
-                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    score = cv2.Laplacian(gray, cv2.CV_64F).var()
-                    scores.append(score)
-            
-            if not frames:
-                return None
-            
-            # Seleccionar frame con mejor score
-            best_index = np.argmax(scores)
-            return frames[best_index]
-            
-        except Exception as e:
-            print(f"Error capturando frame de alta calidad: {e}")
-            return None
-    
-    def set_camera_properties(self, brightness: float = None, 
-                             contrast: float = None, 
-                             saturation: float = None,
-                             exposure: float = None) -> bool:
-        """
-        Configurar propiedades de la cámara
-        
-        Args:
-            brightness: Brillo (0.0 - 1.0)
-            contrast: Contraste (0.0 - 1.0)
-            saturation: Saturación (0.0 - 1.0)
-            exposure: Exposición (-7.0 - 0.0)
-            
-        Returns:
-            True si se configuraron correctamente
-        """
-        if not self.is_initialized or self.cap is None:
+    def is_camera_healthy(self) -> bool:
+        """Verificar si la cámara está funcionando correctamente"""
+        if self._is_releasing:
             return False
+            
+        with self._camera_lock:
+            if self.state != CameraState.CONNECTED or self.cap is None or self._is_releasing:
+                return False
         
         try:
-            if brightness is not None:
-                self.cap.set(cv2.CAP_PROP_BRIGHTNESS, brightness)
-            
-            if contrast is not None:
-                self.cap.set(cv2.CAP_PROP_CONTRAST, contrast)
-            
-            if saturation is not None:
-                self.cap.set(cv2.CAP_PROP_SATURATION, saturation)
-            
-            if exposure is not None:
-                self.cap.set(cv2.CAP_PROP_EXPOSURE, exposure)
-            
-            return True
-            
-        except Exception as e:
-            print(f"Error configurando propiedades de cámara: {e}")
-            return False
-    
-    def get_camera_info(self) -> dict:
-        """
-        Obtener información de la cámara
-        
-        Returns:
-            Diccionario con información de la cámara
-        """
-        if not self.is_initialized or self.cap is None:
-            return {}
-        
-        try:
-            info = {
-                'index': self.camera_index,
-                'width': int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                'height': int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                'fps': self.cap.get(cv2.CAP_PROP_FPS),
-                'brightness': self.cap.get(cv2.CAP_PROP_BRIGHTNESS),
-                'contrast': self.cap.get(cv2.CAP_PROP_CONTRAST),
-                'saturation': self.cap.get(cv2.CAP_PROP_SATURATION),
-                'exposure': self.cap.get(cv2.CAP_PROP_EXPOSURE),
-                'auto_exposure': self.cap.get(cv2.CAP_PROP_AUTO_EXPOSURE)
-            }
-            return info
-            
-        except Exception as e:
-            print(f"Error obteniendo información de cámara: {e}")
-            return {}
-    
-    def save_frame(self, frame: np.ndarray, filename: str) -> bool:
-        """
-        Guardar un frame en archivo
-        
-        Args:
-            frame: Frame a guardar
-            filename: Nombre del archivo
-            
-        Returns:
-            True si se guardó correctamente
-        """
-        try:
-            return cv2.imwrite(filename, frame)
-        except Exception as e:
-            print(f"Error guardando frame: {e}")
-            return False
-    
-    def test_camera_resolutions(self) -> List[Tuple[int, int]]:
-        """
-        Probar diferentes resoluciones soportadas por la cámara
-        
-        Returns:
-            Lista de resoluciones soportadas
-        """
-        if not self.is_initialized:
-            return []
-        
-        test_resolutions = [
-            (320, 240),
-            (640, 480),
-            (800, 600),
-            (1024, 768),
-            (1280, 720),
-            (1920, 1080)
-        ]
-        
-        supported_resolutions = []
-        
-        for width, height in test_resolutions:
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            
-            actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
-            if actual_width == width and actual_height == height:
+            with self._camera_lock:
+                if not self.cap.isOpened() or self._is_releasing:
+                    return False
                 ret, frame = self.cap.read()
-                if ret and frame is not None:
-                    supported_resolutions.append((width, height))
-        
-        # Restaurar resolución original
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-        
-        return supported_resolutions
-    
-    def change_camera(self, new_index: int) -> bool:
-        """
-        Cambiar a una cámara diferente
-        
-        Args:
-            new_index: Índice de la nueva cámara
             
-        Returns:
-            True si se cambió correctamente
-        """
-        try:
-            # Liberar cámara actual
-            self.release_camera()
-            
-            # Cambiar índice y reinicializar
-            self.camera_index = new_index
-            return self.initialize_camera()
+            return ret and frame is not None and frame.size > 0 and not self._is_releasing
             
         except Exception as e:
-            print(f"Error cambiando cámara: {e}")
+            if not self._is_releasing:
+                print(f"Error verificando salud de cámara: {e}")
+            with self._camera_lock:
+                if not self._is_releasing:
+                    self.state = CameraState.ERROR
             return False
     
-    @staticmethod
-    def get_available_cameras() -> List[int]:
-        """
-        Obtener lista de cámaras disponibles
-        
-        Returns:
-            Lista de índices de cámaras disponibles
-        """
-        available_cameras = []
-        
-        # Probar hasta 10 cámaras
-        for index in range(10):
-            try:
-                cap = cv2.VideoCapture(index)
-                if cap.isOpened():
-                    ret, frame = cap.read()
-                    if ret and frame is not None:
-                        available_cameras.append(index)
-                cap.release()
-            except:
-                continue
-        
-        return available_cameras
-    
-    def release_camera(self):
-        """Liberar recursos de la cámara"""
-        try:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
+    def reinitialize_camera(self) -> bool:
+        """Reinicializar la cámara en caso de error"""
+        if self._is_releasing:
+            return False
             
-            self.is_initialized = False
-            print("Cámara liberada")
-            
-        except Exception as e:
-            print(f"Error liberando cámara: {e}")
+        print("Reinicializando cámara...")
+        return self.initialize_camera()
     
-    def __del__(self):
-        """Destructor - liberar recursos"""
-        self.release_camera()
+    def _release_camera_internal(self):
+        """Liberación interna de cámara"""
+        with self._camera_lock:
+            print("Liberando cámara internamente...")
+            self._is_releasing = True
+            self._cleanup_camera_resources()
+            self.last_frame = None
+            self.frame_timestamp = 0
+            self._is_releasing = False
+            print("Cámara liberada internamente")
+    
+    def force_release_camera(self):
+        """Liberar recursos de la cámara forzosamente"""
+        print("Forzando liberación de cámara...")
+        
+        with self._user_lock:
+            self._active_users.clear()
+        
+        self._release_camera_internal()
+    
+    @classmethod
+    def reset_instance(cls):
+        """Resetear la instancia singleton (solo para testing)"""
+        with cls._lock:
+            if cls._instance:
+                try:
+                    cls._instance.force_release_camera()
+                except:
+                    pass
+            cls._instance = None
+
+
+# Usar el singleton como CameraManager
+CameraManager = CameraManagerSingleton

@@ -8,7 +8,7 @@ import numpy as np
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                             QPushButton, QLineEdit, QFrame, QSpacerItem, 
                             QSizePolicy, QMessageBox, QProgressBar)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread, pyqtSlot
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QThread, pyqtSlot, QMutex, QWaitCondition
 from PyQt5.QtGui import QFont, QPixmap, QImage
 
 from ..core.camera_manager import CameraManager
@@ -16,7 +16,7 @@ from ..core.face_recognition_engine import FaceRecognitionEngine
 
 
 class RegistrationWorker(QThread):
-    """Worker thread para el registro de usuario"""
+    """Worker thread mejorado para el registro de usuario"""
     
     registration_complete = pyqtSignal(bool, str)
     
@@ -26,11 +26,104 @@ class RegistrationWorker(QThread):
         self.image = image
         self.name = name
         self.email = email
+        
+        # Control de parada mejorado
+        self._should_run = True
+        self._mutex = QMutex()
+        self._stop_condition = QWaitCondition()
+        self._is_processing = False
+        
+        # Configurar thread
+        self.setObjectName("RegistrationWorker")
     
     def run(self):
-        """Ejecutar el registro en hilo separado"""
-        success, message = self.face_engine.register_face(self.image, self.name, self.email)
-        self.registration_complete.emit(success, message)
+        """Ejecutar el registro en hilo separado con control de parada"""
+        if not self._should_run:
+            return
+            
+        try:
+            # Marcar que estamos procesando
+            self._mutex.lock()
+            self._is_processing = True
+            should_continue = self._should_run
+            self._mutex.unlock()
+            
+            if not should_continue:
+                return
+            
+            # Verificar múltiples veces durante el procesamiento
+            for i in range(3):
+                self._mutex.lock()
+                should_continue = self._should_run
+                self._mutex.unlock()
+                
+                if not should_continue:
+                    return
+                
+                # Pequeña pausa para dar oportunidad de cancelar
+                if i > 0:
+                    self.msleep(50)
+            
+            # Realizar registro si aún debemos continuar
+            self._mutex.lock()
+            should_continue = self._should_run
+            self._mutex.unlock()
+            
+            if should_continue:
+                success, message = self.face_engine.register_face(
+                    self.image, self.name, self.email
+                )
+                
+                # Verificar antes de emitir resultado
+                self._mutex.lock()
+                should_emit = self._should_run
+                self._mutex.unlock()
+                
+                if should_emit:
+                    self.registration_complete.emit(success, message)
+                
+        except Exception as e:
+            # Verificar si aún debemos emitir error
+            self._mutex.lock()
+            should_emit = self._should_run
+            self._mutex.unlock()
+            
+            if should_emit:
+                error_msg = f"Error en registro: {str(e)}"
+                self.registration_complete.emit(False, error_msg)
+        
+        finally:
+            # Marcar que terminamos el procesamiento
+            self._mutex.lock()
+            self._is_processing = False
+            self._stop_condition.wakeAll()
+            self._mutex.unlock()
+    
+    def stop_worker(self):
+        """Detener el worker de forma segura"""
+        self._mutex.lock()
+        self._should_run = False
+        self._stop_condition.wakeAll()
+        self._mutex.unlock()
+        
+        # Desconectar señales para evitar emisiones tardías
+        try:
+            self.registration_complete.disconnect()
+        except:
+            pass  # Ignorar si ya está desconectado
+    
+    def wait_for_finish(self, timeout_ms=3000):
+        """Esperar a que termine con timeout"""
+        self._mutex.lock()
+        
+        if self._is_processing:
+            # Esperar con timeout
+            self._stop_condition.wait(self._mutex, timeout_ms)
+        
+        self._mutex.unlock()
+        
+        # Esperar que el thread termine
+        return self.wait(timeout_ms)
 
 
 class RegistrationScreen(QWidget):
@@ -46,6 +139,8 @@ class RegistrationScreen(QWidget):
         self.current_frame = None
         self.timer = QTimer()
         self.registration_worker = None
+        self._is_closing = False
+        self._cleanup_timer = None
         
         self.init_ui()
         self.setup_camera()
@@ -330,6 +425,9 @@ class RegistrationScreen(QWidget):
     
     def setup_camera(self):
         """Configurar y iniciar la cámara"""
+        if self._is_closing:
+            return
+            
         try:
             if self.camera_manager.initialize_camera():
                 self.timer.timeout.connect(self.update_frame)
@@ -344,6 +442,9 @@ class RegistrationScreen(QWidget):
     
     def update_frame(self):
         """Actualizar frame de la cámara"""
+        if self._is_closing:
+            return
+            
         try:
             frame = self.camera_manager.get_frame()
             if frame is not None:
@@ -484,6 +585,9 @@ class RegistrationScreen(QWidget):
     
     def register_user(self):
         """Registrar nuevo usuario"""
+        if self._is_closing:
+            return
+            
         # Validar campos
         name = self.name_input.text().strip()
         email = self.email_input.text().strip()
@@ -516,25 +620,66 @@ class RegistrationScreen(QWidget):
             if reply == QMessageBox.No:
                 return
         
+        # Limpiar worker anterior si existe
+        self.cleanup_registration_worker()
+        
         # Deshabilitar botones y mostrar progreso
         self.btn_register.setEnabled(False)
         self.btn_back.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Progreso indeterminado
         
-        # Iniciar registro en hilo separado
+        # Crear y configurar nuevo worker
         self.registration_worker = RegistrationWorker(
             self.face_engine, 
             self.current_frame, 
             name, 
             email
         )
+        
+        # Conectar señales
         self.registration_worker.registration_complete.connect(self.on_registration_complete)
+        self.registration_worker.finished.connect(self.on_registration_worker_finished)
+        
+        # Iniciar worker
         self.registration_worker.start()
+    
+    def cleanup_registration_worker(self):
+        """Limpiar worker de registro de forma segura"""
+        if self.registration_worker is not None:
+            print("Limpiando registration worker...")
+            
+            try:
+                # Detener worker si está corriendo
+                if self.registration_worker.isRunning():
+                    self.registration_worker.stop_worker()
+                    
+                    # Esperar con timeout
+                    if not self.registration_worker.wait_for_finish(3000):
+                        print("Registration worker no terminó a tiempo, terminando forzosamente")
+                        self.registration_worker.terminate()
+                        self.registration_worker.wait(1000)
+                
+                # Marcar para eliminación
+                self.registration_worker.deleteLater()
+                self.registration_worker = None
+                print("Registration worker limpiado correctamente")
+                
+            except Exception as e:
+                print(f"Error limpiando registration worker: {e}")
+                # Forzar limpieza
+                if self.registration_worker:
+                    self.registration_worker.terminate()
+                    self.registration_worker.wait(1000)
+                    self.registration_worker.deleteLater()
+                    self.registration_worker = None
     
     @pyqtSlot(bool, str)
     def on_registration_complete(self, success, message):
         """Manejar completación del registro"""
+        if self._is_closing:
+            return
+            
         # Ocultar progreso y rehabilitar botones
         self.progress_bar.setVisible(False)
         self.btn_register.setEnabled(True)
@@ -557,14 +702,19 @@ class RegistrationScreen(QWidget):
             """)
         else:
             QMessageBox.critical(self, "Error", f"Error en el registro:\n{message}")
-        
-        # Limpiar worker
-        if self.registration_worker:
+    
+    @pyqtSlot()
+    def on_registration_worker_finished(self):
+        """Manejar finalización del worker"""
+        if not self._is_closing and self.registration_worker:
             self.registration_worker.deleteLater()
             self.registration_worker = None
     
     def toggle_camera(self):
         """Alternar estado de la cámara"""
+        if self._is_closing:
+            return
+            
         self.timer.stop()
         self.camera_manager.release_camera()
         
@@ -577,16 +727,56 @@ class RegistrationScreen(QWidget):
     
     def show_error(self, message):
         """Mostrar mensaje de error"""
-        QMessageBox.critical(self, "Error", message)
+        if not self._is_closing:
+            QMessageBox.critical(self, "Error", message)
     
     def closeEvent(self, event):
-        """Manejar cierre de la ventana"""
+        """Manejar cierre mejorado de la ventana"""
+        print("Cerrando Registration Screen...")
+        self._is_closing = True
+        
+        # Ignorar evento inicialmente para manejo seguro
+        event.ignore()
+        
+        # Detener timer si está activo
         if self.timer.isActive():
             self.timer.stop()
         
-        if self.registration_worker and self.registration_worker.isRunning():
-            self.registration_worker.quit()
-            self.registration_worker.wait()
+        # Limpiar worker
+        self.cleanup_registration_worker()
         
-        self.camera_manager.release_camera()
+        # Liberar cámara
+        try:
+            self.camera_manager.release_camera()
+            print("Cámara liberada correctamente")
+        except Exception as e:
+            print(f"Error liberando cámara: {e}")
+        
+        # Usar timer para finalizar cierre de forma segura
+        if not self._cleanup_timer:
+            self._cleanup_timer = QTimer()
+            self._cleanup_timer.setSingleShot(True)
+            self._cleanup_timer.timeout.connect(lambda: self._finalize_close(event))
+            self._cleanup_timer.start(1000)  # Esperar 1 segundo
+    
+    def _finalize_close(self, event):
+        """Finalizar el cierre después de limpiar recursos"""
+        print("Finalizando cierre de Registration Screen...")
+        
+        # Verificación final de threads
+        if self.registration_worker is not None:
+            if self.registration_worker.isRunning():
+                print("Warning: Registration worker aún corriendo, terminando...")
+                self.registration_worker.terminate()
+                self.registration_worker.wait(2000)
+            
+            self.registration_worker.deleteLater()
+            self.registration_worker = None
+        
+        # Limpiar timer de cleanup
+        if self._cleanup_timer:
+            self._cleanup_timer.deleteLater()
+            self._cleanup_timer = None
+        
+        print("Registration Screen cerrada correctamente")
         event.accept()
